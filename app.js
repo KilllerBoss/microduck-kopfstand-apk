@@ -18,7 +18,7 @@ var holdCurSteps = 0, holdBestSteps = 0, sVal = 0, scores = null;
 var pendingPush = null;
 var rng = DuckCore.mulberry32(1234567);
 var epCount = 0, epBestAllSteps = 0;
-var meshes = [];
+var bodyGroups = [], floorMesh = null;
 
 function radians(deg) { return deg * Math.PI / 180; }
 
@@ -64,17 +64,20 @@ function initScene() {
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(view.clientWidth, view.clientHeight);
+  renderer.outputEncoding = THREE.sRGBEncoding;          // wie der Original-Space-Renderer
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
   view.insertBefore(renderer.domElement, view.firstChild);
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0e1218);
+  scene.background = new THREE.Color(0.0036, 0.0062, 0.0105); // kalibriert: ergibt ~0x0b0f16 nach ACES+sRGB
   camera = new THREE.PerspectiveCamera(42, view.clientWidth / view.clientHeight, 0.005, 30);
 
-  scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a3040, 0.95));
-  var dl = new THREE.DirectionalLight(0xffffff, 0.85);
+  scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a3040, 0.75));
+  var dl = new THREE.DirectionalLight(0xffffff, 0.7);
   dl.position.set(0.6, 1.2, 0.5);
   scene.add(dl);
-  var dl2 = new THREE.DirectionalLight(0x88aaff, 0.25);
+  var dl2 = new THREE.DirectionalLight(0x88aaff, 0.3);
   dl2.position.set(-0.6, 0.4, -0.5);
   scene.add(dl2);
 
@@ -84,40 +87,23 @@ function initScene() {
   scene.add(robotGroup);
 
   var m = sim.model;
+  // Nur der Boden kommt aus der Physik-Szene; der Roboter wird als
+  // Original-Microduck-GLB-Meshes (pollen-robotics) gerendert.
   for (var g = 0; g < sim.ngeom; g++) {
-    var type = m.geom_type[g];
-    var sx = m.geom_size[g * 3], sy = m.geom_size[g * 3 + 1], sz = m.geom_size[g * 3 + 2];
-    var geo = null;
-    if (type === DuckCore.MJ_GEOM.PLANE) {
-      geo = new THREE.PlaneGeometry(Math.max(2 * (sx || 0.8), 1.4), Math.max(2 * (sy || 0.8), 1.4));
-    } else if (type === DuckCore.MJ_GEOM.SPHERE) {
-      geo = new THREE.SphereGeometry(sx, 28, 20);
-    } else if (type === DuckCore.MJ_GEOM.CAPSULE) {
-      geo = new THREE.CapsuleGeometry(sx, sz * 2, 6, 18);
-      geo.rotateX(Math.PI / 2); // Kapsel-Achse Y -> Z (MuJoCo)
-    } else if (type === DuckCore.MJ_GEOM.BOX) {
-      geo = new THREE.BoxGeometry(2 * sx, 2 * sy, 2 * sz);
-    } else {
-      geo = null;
-    }
-    if (!geo) { meshes.push(null); continue; }
-    var rgba = [m.geom_rgba[g * 4], m.geom_rgba[g * 4 + 1], m.geom_rgba[g * 4 + 2], m.geom_rgba[g * 4 + 3]];
-    var mat = new THREE.MeshLambertMaterial({
-      color: new THREE.Color(rgba[0], rgba[1], rgba[2]),
-      transparent: rgba[3] < 0.999, opacity: rgba[3]
-    });
-    if (type === DuckCore.MJ_GEOM.PLANE) {
-      mat.color.setHex(0x161c26); // dunkler Boden statt rgba
-      mat.side = THREE.DoubleSide;
-    }
-    var mesh = new THREE.Mesh(geo, mat);
-    robotGroup.add(mesh);
-    meshes.push(mesh);
+    if (m.geom_type[g] !== DuckCore.MJ_GEOM.PLANE) continue;
+    var sx = m.geom_size[g * 3], sy = m.geom_size[g * 3 + 1];
+    var geoF = new THREE.PlaneGeometry(Math.max(2 * (sx || 0.8), 1.4), Math.max(2 * (sy || 0.8), 1.4));
+    var matF = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.0036, 0.0062, 0.0105), side: THREE.DoubleSide }); // kalibriert dunkel
+    floorMesh = new THREE.Mesh(geoF, matF);
+    robotGroup.add(floorMesh);
+    break;
   }
   // dezentes Raster auf dem Boden
-  var grid = new THREE.GridHelper(0.9, 18, 0x27303f, 0x1a212c);
+  var grid = new THREE.GridHelper(0.9, 18, 0x1c2530, 0x121821);
   grid.position.y = 0.0005;
   robotGroup.add(grid);
+
+  buildRobotVisuals();
 
   updateCamera();
   window.addEventListener('resize', onResize);
@@ -176,18 +162,66 @@ function bindOrbit(el) {
 var _m4 = null;
 function syncMeshes() {
   var d = sim.data;
-  for (var g = 0; g < meshes.length; g++) {
-    var mesh = meshes[g];
-    if (!mesh) continue;
-    mesh.position.set(d.geom_xpos[g * 3], d.geom_xpos[g * 3 + 1], d.geom_xpos[g * 3 + 2]);
-    var o = g * 9;
-    if (!_m4) _m4 = new THREE.Matrix4();
+  if (!_m4) _m4 = new THREE.Matrix4();
+  for (var b = 0; b < bodyGroups.length; b++) {
+    var grp = bodyGroups[b];
+    if (!grp) continue;
+    grp.position.set(d.xpos[b * 3], d.xpos[b * 3 + 1], d.xpos[b * 3 + 2]);
+    var o = b * 9;
     _m4.set(
-      d.geom_xmat[o], d.geom_xmat[o + 1], d.geom_xmat[o + 2], 0,
-      d.geom_xmat[o + 3], d.geom_xmat[o + 4], d.geom_xmat[o + 5], 0,
-      d.geom_xmat[o + 6], d.geom_xmat[o + 7], d.geom_xmat[o + 8], 0,
+      d.xmat[o], d.xmat[o + 1], d.xmat[o + 2], 0,
+      d.xmat[o + 3], d.xmat[o + 4], d.xmat[o + 5], 0,
+      d.xmat[o + 6], d.xmat[o + 7], d.xmat[o + 8], 0,
       0, 0, 0, 1);
-    mesh.quaternion.setFromRotationMatrix(_m4);
+    grp.quaternion.setFromRotationMatrix(_m4);
+  }
+}
+
+/* ---------------- Original-Microduck-Visuals (pollen-robotics) ---------------- */
+function typedFromBin(u8, byteOff, count, compType) {
+  var Ctor = compType === 5126 ? Float32Array : (compType === 5125 ? Uint32Array : Uint16Array);
+  var esz = compType === 5121 ? 1 : (compType === 5123 ? 2 : 4);
+  if (byteOff % esz === 0) return new Ctor(u8.buffer, u8.byteOffset + byteOff, count);
+  var out = new Ctor(count), dv = new DataView(u8.buffer, u8.byteOffset);
+  for (var i = 0; i < count; i++) {
+    out[i] = compType === 5126 ? dv.getFloat32(byteOff + i * 4, true)
+           : compType === 5125 ? dv.getUint32(byteOff + i * 4, true)
+           : dv.getUint16(byteOff + i * 2, true);
+  }
+  return out;
+}
+
+function buildRobotVisuals() {
+  var u8 = b64ToUint8(DUCK_VISUAL.bin);
+  var geoms = {};
+  var names = Object.keys(DUCK_VISUAL.meshes);
+  for (var i = 0; i < names.length; i++) {
+    var e = DUCK_VISUAL.meshes[names[i]];
+    var g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(typedFromBin(u8, e.p[0], e.p[1], e.p[2]), 3));
+    if (e.n) g.setAttribute('normal', new THREE.BufferAttribute(typedFromBin(u8, e.n[0], e.n[1], e.n[2]), 3));
+    g.setIndex(new THREE.BufferAttribute(typedFromBin(u8, e.i[0], e.i[1], e.i[2]), 1));
+    if (!e.n) g.computeVertexNormals();
+    geoms[names[i]] = g;
+  }
+  for (var bi = 0; bi < DUCK_VISUAL.bodies.length; bi++) {
+    var B = DUCK_VISUAL.bodies[bi];
+    var bid = sim.mj.mj_name2id(sim.model, 1, B.name); // 1 = mjOBJ_BODY
+    if (bid < 0) continue;
+    var grp = new THREE.Group();
+    for (var gi = 0; gi < B.geoms.length; gi++) {
+      var G = B.geoms[gi];
+      var mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(G[8], G[9], G[10]).convertSRGBToLinear(),
+        roughness: 0.55, metalness: 0.15
+      });
+      var mesh = new THREE.Mesh(geoms[G[0]], mat);
+      mesh.position.set(G[1], G[2], G[3]);
+      mesh.quaternion.set(G[5], G[6], G[7], G[4]); // MJCF (w,x,y,z) -> THREE (x,y,z,w)
+      grp.add(mesh);
+    }
+    robotGroup.add(grp);
+    bodyGroups[bid] = grp;
   }
 }
 
@@ -331,7 +365,8 @@ function runTestHook() {
 
 /* ---------------- Los ---------------- */
 if (typeof DuckCore === 'undefined' || typeof loadMujoco === 'undefined' ||
-    typeof MUJOCO_WASM_B64 === 'undefined' || typeof DUCK_DATA === 'undefined') {
+    typeof MUJOCO_WASM_B64 === 'undefined' || typeof DUCK_DATA === 'undefined' ||
+    typeof DUCK_VISUAL === 'undefined') {
   document.getElementById('loadMsg').textContent = 'Fehler: Assets fehlen!';
 } else {
   boot();
