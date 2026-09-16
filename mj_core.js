@@ -92,6 +92,62 @@
     };
   }
 
+  // ---------------- Referenz-Policy (61 -> 512 -> 256 -> 128 -> 14, Elu) ----------------
+  // pollen-robotics/microduck (BEST_alpha_stand, roulade). Graph:
+  // x=(obs-mean)/std -> GEMM/Elu x3 -> GEMM -> act. ctrl = DEFAULT_POSE + act.
+  // Gewichte: b64-encodierte Float32-Arrays, row-major [out,in] (transB=1).
+  function b64ToF32(b64) {
+    var bin = atob(b64), n = bin.length;
+    var buf = new ArrayBuffer(n);
+    var u8 = new Uint8Array(buf);
+    for (var i = 0; i < n; i++) u8[i] = bin.charCodeAt(i);
+    return new Float32Array(buf);
+  }
+  function decodeRef(R) {
+    var out = {};
+    for (var k in R) {
+      if (k === 'n1' || k === 'n2' || k === 'n3' || k === 'nOut' || k === 'nIn') out[k] = R[k];
+      else out[k] = b64ToF32(R[k]);
+    }
+    return out;
+  }
+  function makeRefPolicy(RAW) {
+    var W = decodeRef(RAW);
+    var nIn = W.nIn, n1 = W.n1, n2 = W.n2, n3 = W.n3, nOut = W.nOut;
+    var h1 = new Float64Array(n1), h2 = new Float64Array(n2), h3 = new Float64Array(n3);
+    return {
+      act: function (obs) {
+        var i, j;
+        var x = new Float64Array(nIn);
+        for (i = 0; i < nIn; i++) {
+          x[i] = clamp((obs[i] - W.mean[i]) / W.std[i], -1e4, 1e4);
+        }
+        for (i = 0; i < n1; i++) {
+          var off = i * nIn, acc = W.b1[i];
+          for (j = 0; j < nIn; j++) acc += W.W1[off + j] * x[j];
+          h1[i] = acc > 0 ? acc : Math.expm1(acc); // Elu(alpha=1)
+        }
+        for (i = 0; i < n2; i++) {
+          var off2 = i * n1, acc2 = W.b2[i];
+          for (j = 0; j < n1; j++) acc2 += W.W2[off2 + j] * h1[j];
+          h2[i] = acc2 > 0 ? acc2 : Math.expm1(acc2);
+        }
+        for (i = 0; i < n3; i++) {
+          var off3 = i * n2, acc3 = W.b3[i];
+          for (j = 0; j < n2; j++) acc3 += W.W3[off3 + j] * h2[j];
+          h3[i] = acc3 > 0 ? acc3 : Math.expm1(acc3);
+        }
+        var out = new Float64Array(nOut);
+        for (i = 0; i < nOut; i++) {
+          var off4 = i * n3, acc4 = W.b4[i];
+          for (j = 0; j < n3; j++) acc4 += W.W4[off4 + j] * h3[j];
+          out[i] = acc4;
+        }
+        return out;
+      }
+    };
+  }
+
   // ---------------- Simulation (Env-Port) ----------------
   function Sim(mj, xmlString, q2) {
     this.mj = mj;
@@ -147,6 +203,7 @@
     this.q2 = Array.from(q2);
 
     this._lastA = new Float64Array(this.nu);
+    this._lastAref = new Float64Array(this.nu);
     this._errPrev = null;
     this.t = 0;
     this._tmp3 = new Float64Array(3);
@@ -282,6 +339,78 @@
     var finite = isFinite(d.qpos[0]) && isFinite(d.qpos[1]) && isFinite(d.qpos[2]);
     var terminated = (!finite) || d.qpos[2] < -0.02;
     return { s: sc.s, scores: sc, terminated: terminated };
+  };
+
+  // ---------------- Referenz-Interface (61D obs + DEFAULT_POSE-Off-Konvention) ----------------
+  var REF_CMD = null; // 13 Nullen, lazy
+  Sim.prototype.obs61 = function () {
+    var d = this.data;
+    var obs = new Float64Array(61);
+    var R = this._tmpR || (this._tmpR = new Float64Array(9));
+    var tb = this.trunkBid * 9;
+    for (var i = 0; i < 9; i++) R[i] = d.xmat[tb + i];
+    // [0..2] base_ang_vel (gyro im Trunk-Frame == qvel[3:6], imu-Site hat Identitaetsquat)
+    obs[0] = d.qvel[3]; obs[1] = d.qvel[4]; obs[2] = d.qvel[5];
+    // [3..5] projected gravity
+    obs[3] = -R[6]; obs[4] = -R[7]; obs[5] = -R[8];
+    // [6..19] joint_pos - DEFAULT_POSE
+    for (var q = 0; q < this.nu; q++) obs[6 + q] = d.qpos[7 + q] - SEQ_DEFAULT_POSE[q];
+    // [20..33] joint_vel
+    for (var qd = 0; qd < this.nu; qd++) obs[20 + qd] = d.qvel[6 + qd];
+    // [34..47] last_action
+    for (var la = 0; la < this.nu; la++) obs[34 + la] = this._lastAref[la];
+    // [48..60] command: Nullen (kein Input, kein Head-Mode)
+    for (var c = 0; c < 13; c++) obs[48 + c] = 0;
+    return obs;
+  };
+
+  // Referenz-Step: ctrl = DEFAULT_POSE + act (KEIN q_range-Clip, wie Referenz), 10 Substeps
+  Sim.prototype.stepRef = function (act) {
+    var d = this.data, a = new Float64Array(this.nu);
+    for (var i = 0; i < this.nu; i++) a[i] = act[i];
+    for (var k = 0; k < this.nu; k++) d.ctrl[k] = SEQ_DEFAULT_POSE[k] + a[k];
+    for (var st = 0; st < this.nSub; st++) this.mj.mj_step(this.model, this.data);
+    this.t++;
+    this._lastAref = a;
+    return { terminated: (!isFinite(d.qpos[0]) || !isFinite(d.qpos[2])) };
+  };
+
+  // Physik-Experiment: Kopf-Kugel-Kontakt Rolling-Widerstand (condim 6).
+  // friction[geom] = [slide, torsional, rolling]; kombiniert per Element-MAX im Kontakt.
+  // roll == 0 -> condim 3 restauriert (exakt Originalphysik, keine Solver-Differenz).
+  Sim.prototype.setHeadRolling = function (slide, roll) {
+    var m = this.model;
+    m.geom_condim[this.headG] = roll > 0 ? 6 : 3;
+    m.geom_friction[this.headG * 3] = slide;
+    m.geom_friction[this.headG * 3 + 1] = 0.005;
+    m.geom_friction[this.headG * 3 + 2] = roll;
+  };
+
+  Sim.prototype.projGravZ = function () {
+    var R = this._tmpR4 || (this._tmpR4 = new Float64Array(9));
+    var tb = this.trunkBid * 9;
+    for (var i = 0; i < 9; i++) R[i] = this.data.xmat[tb + i];
+    return -R[8];
+  };
+
+  Sim.prototype.headZ = function () {
+    var hg = this.headG * 3;
+    return this.data.geom_xpos[hg + 2];
+  };
+
+  Sim.prototype.feetZmin = function () {
+    var zmin = 1e9;
+    for (var s2 = 0; s2 < this.soleGids.length; s2++) {
+      var g = this.soleGids[s2], gm = g * 9, gp = g * 3;
+      var corners = this.soleCorners[s2];
+      for (var ci = 0; ci < corners.length; ci++) {
+        var cn = corners[ci];
+        var wz = this.data.geom_xmat[gm + 6] * cn[0] + this.data.geom_xmat[gm + 7] * cn[1] + this.data.geom_xmat[gm + 8] * cn[2]
+               + this.data.geom_xpos[gp + 2];
+        if (wz < zmin) zmin = wz;
+      }
+    }
+    return zmin;
   };
 
   // ---------------- Sequenz: STAND -> Kippen -> Kopf-Kontakt -> Beine hoch -> Release ----------------
@@ -519,6 +648,7 @@
     for (var i = 0; i < this.nq; i++) d.qpos[i] = this.standQ[i];
     this.mj.mj_forward(this.model, this.data);
     this._lastA = new Float64Array(this.nu);
+    this._lastAref = new Float64Array(this.nu);
     this._errPrev = null;
     this.t = 0;
   };
@@ -558,6 +688,8 @@
     CONTROL_DT: CONTROL_DT, CONTROL_HZ: CONTROL_HZ,
     Sim: Sim, makePolicy: makePolicy, runEpisode: runEpisode,
     makeSequence: makeSequence, SEQ_DEFAULT_POSE: SEQ_DEFAULT_POSE, SEQ_N_STAND: SEQ_N_STAND,
+    makeRefPolicy: makeRefPolicy,
+    REF_DEFAULT_POSE: SEQ_DEFAULT_POSE,
     mulberry32: mulberry32, gaussPair: gaussPair,
     MJ_GEOM: { PLANE: MJ_GEOM_PLANE, SPHERE: MJ_GEOM_SPHERE, CAPSULE: MJ_GEOM_CAPSULE, BOX: MJ_GEOM_BOX }
   };

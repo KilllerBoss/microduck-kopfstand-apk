@@ -91,7 +91,7 @@
 
   <div id="panel">
     <div id="btnRow">
-      <button id="btnSeq" style="background:var(--accent)">Kopfstand-Ablauf</button>
+      <button id="btnSeq" style="background:var(--accent)">Ablauf-Loop</button>
       <button id="btnReset" style="background:var(--panel2);color:var(--text);border:1px solid var(--line)">Direkt-Halt</button>
       <button id="btnPush" style="background:var(--panel2);color:var(--text);border:1px solid var(--line)">Schubser</button>
     </div>
@@ -107,7 +107,7 @@
       <label class="chk"><input type="checkbox" id="cbAuto" checked> Auto-Reset</label>
       <label class="chk"><input type="checkbox" id="cbSlow"> Zeitlupe &frac14;</label>
     </div>
-    <div id="foot">Ablauf: Stehen &rarr; Kopf senken &rarr; Beine hoch &rarr; Policy balanciert auf Kopf &middot; Direkt-Halt startet im Kopfstand</div>
+    <div id="foot">Ablauf: Stehen (Ref-Policy) &rarr; Roulade (Ref-Policy) &rarr; Kopf am Boden + Beine dr&uuml;ber &rarr; meine Policy balanciert auf Kopf &middot; Sturz = Loop neu</div>
   </div>
 </div>
 
@@ -115,6 +115,7 @@
 <script src="mujoco_glue.js"></script>
 <script src="data_wasm.js"></script>
 <script src="data_policy.js"></script>
+<script src="data_ref.js"></script>
 <script src="data_visual.js"></script>
 <script src="mj_core.js"></script>
 <script src="app.js"></script>

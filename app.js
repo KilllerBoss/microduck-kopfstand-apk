@@ -1,5 +1,16 @@
 /* Microduck Kopfstand - App (WebView/Chrome). Nutzt DuckCore (mj_core.js),
- * loadMujoco (mujoco_glue.js, WASM via data_wasm.js), DUCK_DATA (data_policy.js), THREE. */
+ * loadMujoco (mujoco_glue.js, WASM via data_wasm.js), DUCK_DATA (data_policy.js),
+ * REF_DATA (data_ref.js: BEST_alpha_stand + roulade), THREE.
+ *
+ * Kopfstand-Ablauf (Policy-Kette):
+ *   STEHEN   - BEST_alpha_stand.onnx balanciert im Stand (1.2 s)
+ *   ROULADE  - roulade.onnx kippt zurueck; Uebergabe, sobald Kopf Boden
+ *              beruehrt UND die Beine drueber sind (Apex-Catch)
+ *   UEBERNAHME - kurze Ueberfuehrung in den trainierten Kopfstand-Init (0.4 s)
+ *   KOPFSTAND- meine Policy (52D) balanciert auf dem Kopf; Kopfkontakt hat
+ *              Rolling-Widerstand (condim 6) -> lange Haltezeit
+ *   Sturz    - Auto-Reset, Ablauf startet von neu (Loop)
+ */
 'use strict';
 
 /* ---------------- Hilfen ---------------- */
@@ -12,14 +23,20 @@ function b64ToUint8(b64) {
 function setBar(id, v) { $(id).firstChild.style.width = (100 * Math.max(0, Math.min(1, v))).toFixed(1) + '%'; }
 
 /* ---------------- Globale App-Zustände ---------------- */
-var sim = null, policy = null, mj = null, seq = null;
+var sim = null, policy = null, standPol = null, rollPol = null, mj = null;
 var running = false, episodeOver = false, overAt = 0;
-var seqMode = false, seqPhase = 'idle', seqStandSteps = 0, seqLowSteps = 0;
+var chainMode = false, chainPhase = 'idle', chainSteps = 0, chainLowSteps = 0;
+var blendData = null;
 var holdCurSteps = 0, holdBestSteps = 0, sVal = 0, scores = null;
 var pendingPush = null;
 var rng = DuckCore.mulberry32(1234567);
 var epCount = 0, epBestAllSteps = 0;
 var bodyGroups = [], floorMesh = null;
+
+var CHAIN_STAND_STEPS = 60;   // 1.2 s stehen
+var CHAIN_ROLL_MAX = 150;     // 3 s Rouladen-Fenster (wie Referenz)
+var CHAIN_BLEND_STEPS = 20;   // 0.4 s Uebernahme
+var HEAD_ROLLING = 0.3;       // Rolling-Widerstand Kopfkontakt (Haltephase)
 
 function radians(deg) { return deg * Math.PI / 180; }
 
@@ -34,10 +51,11 @@ async function boot() {
     await new Promise(function (r) { setTimeout(r, 30); });
     mj = await loadMujoco({ wasmBinary: bin });
 
-    msg.textContent = 'Lade Microduck-Modell\u2026';
+    msg.textContent = 'Lade Microduck-Modell + 3 Policies\u2026';
     sim = new DuckCore.Sim(mj, DUCK_DATA.xml, DUCK_DATA.q2);
-    policy = DuckCore.makePolicy(DUCK_DATA.weights);
-    seq = DuckCore.makeSequence(sim);
+    policy = DuckCore.makePolicy(DUCK_DATA.weights);          // Kopfstand (52D)
+    standPol = DuckCore.makeRefPolicy(REF_DATA.stand);        // Stehen (61D, Referenz)
+    rollPol = DuckCore.makeRefPolicy(REF_DATA.roll);          // Roulade (61D, Referenz)
 
     msg.textContent = 'Baue 3D-Szene\u2026';
     initScene();
@@ -229,7 +247,8 @@ function buildRobotVisuals() {
 
 /* ---------------- Episode / Steuerung ---------------- */
 function resetEpisode() {
-  seqMode = false; seqPhase = 'idle';
+  chainMode = false; chainPhase = 'idle';
+  sim.setHeadRolling(1.0, 0); // Rolling aus (nur Haltephase)
   $('tilt').disabled = false; $('cbRand').disabled = false;
   var tiltDeg = parseFloat($('tilt').value);
   var tiltRad = 0, axis = [1, 0, 0];
@@ -249,21 +268,22 @@ function resetEpisode() {
   setStatus('mid', 'Direkt: Episode ' + epCount);
 }
 
-/* Volle Sequenz: STAND -> Kopf senken -> Ueberschlag -> Beine hoch -> Policy */
-function startSequence() {
-  seqMode = true; seqPhase = 'stand'; seqStandSteps = 0;
+/* Policy-Kette: STEHEN -> ROULADE -> UEBERNAHME -> KOPFSTAND (-> Loop) */
+function startChain() {
+  chainMode = true; chainPhase = 'chainStand'; chainSteps = 0;
+  sim.setHeadRolling(1.0, 0);
   $('tilt').disabled = true; $('cbRand').disabled = true;
   sim.resetStand();
   holdCurSteps = 0; holdBestSteps = 0; episodeOver = false;
   pendingPush = null; sVal = 0; scores = sim.computeScores();
   epCount++;
   running = true;
-  setStatus('mid', 'STAND');
+  setStatus('mid', 'STEHEN (Policy 1)');
 }
 
 function doControlStep() {
   if (episodeOver) return;
-  if (seqMode) { doSeqStep(); return; }
+  if (chainMode) { doChainStep(); return; }
   var obs = sim.obs52();
   if ($('cbNoise').checked) {
     for (var n1 = 0; n1 < 3; n1++) obs[n1] += 0.03 * DuckCore.gaussPair(rng);
@@ -289,67 +309,103 @@ function doControlStep() {
   else if (sVal > 0.05) setStatus('mid', 'Instabil');
 }
 
-/* Sequenz-Step: stand (Physik) -> A/B/C (kinematisch) -> hold (Policy) */
-function doSeqStep() {
-  if (seqPhase === 'stand') {
-    sim.stepControl(DuckCore.SEQ_DEFAULT_POSE);
-    if (++seqStandSteps >= DuckCore.SEQ_N_STAND) {
-      seq.begin();
-      seqPhase = 'A';
-      setStatus('mid', 'KOPF SENKEN');
+/* ---- Policy-Kette ---- */
+function doChainStep() {
+  var i;
+  if (chainPhase === 'chainStand') {
+    var rs = sim.stepRef(standPol.act(sim.obs61()));
+    sVal = 0; scores = null;
+    if (rs.terminated) { chainFail('STAND gekippt'); return; }
+    if (++chainSteps >= CHAIN_STAND_STEPS) {
+      chainPhase = 'chainRoll'; chainSteps = 0;
+      setStatus('mid', 'ROULADE (Policy 2)');
     }
     return;
   }
-  if (seqPhase === 'A' || seqPhase === 'B' || seqPhase === 'C') {
-    seq.step();
-    var sc = sim.computeScores();
-    sVal = sc.s; scores = sc;
-    if (seqPhase === 'A' && seq.phase === 'B') {
-      seqPhase = 'B';
-      setStatus('mid', '\u00dcBERSCHLAG');
-    } else if (seqPhase === 'B' && seq.phase === 'C') {
-      seqPhase = 'C';
-      setStatus('mid', 'BEINE HOCH');
-    } else if (seqPhase === 'C' && seq.phase === 'release') {
-      // Release: exakter Eval-Init, Policy uebernimmt
-      sim.reset({ tiltRad: 0, fall: 0.001, jointNoise: 0, velNoise: 0, rng: rng });
-      seqPhase = 'hold'; holdCurSteps = 0;
-      setStatus('ok', 'BALANCE (Policy)');
+  if (chainPhase === 'chainRoll') {
+    var r = sim.stepRef(rollPol.act(sim.obs61()));
+    var sc0 = sim.computeScores(); sVal = sc0.s; scores = sc0;
+    var gyro = Math.hypot(sim.data.qvel[3], sim.data.qvel[4], sim.data.qvel[5]);
+    var hz = sim.headZ(), fz = sim.feetZmin(), pgz = sim.projGravZ();
+    // Uebergabe: Kopf beruehrt Boden UND Beine drueber (Apex)
+    if (chainSteps > 8 && pgz > 0.65 && fz > hz + 0.03 && gyro < 5.0 && hz - sim.headR < 0.012) {
+      // Blend-Daten einfrieren
+      var q0 = [sim.data.qpos[3], sim.data.qpos[4], sim.data.qpos[5], sim.data.qpos[6]];
+      var j0 = [];
+      for (i = 0; i < sim.nu; i++) j0.push(sim.data.qpos[7 + i]);
+      blendData = { p0: [sim.data.qpos[0], sim.data.qpos[1], sim.data.qpos[2]], q0: q0, j0: j0 };
+      chainPhase = 'chainBlend'; chainSteps = 0;
+      setStatus('mid', '\u00dcBERNAHME');
+      flash('KOPF AM BODEN \u2013 POLICY KOMMT', 'var(--accent)');
+      return;
+    }
+    if (r.terminated || ++chainSteps >= CHAIN_ROLL_MAX) { chainFail('Roulade fehlgeschlagen'); return; }
+    return;
+  }
+  if (chainPhase === 'chainBlend') {
+    // Ueberfuehrung in den trainierten Kopfstand-Init (hsQ + q2)
+    var hsQ = sim.hsQ, u = (chainSteps + 1) / CHAIN_BLEND_STEPS;
+    var e = u * u * (3 - 2 * u);
+    var p0 = blendData.p0, q0b = blendData.q0, j0 = blendData.j0;
+    sim.data.qpos[0] = p0[0] + e * (hsQ[0] - p0[0]);
+    sim.data.qpos[1] = p0[1] + e * (hsQ[1] - p0[1]);
+    sim.data.qpos[2] = p0[2] + e * (hsQ[2] - p0[2]);
+    var d = q0b[0] * hsQ[3] + q0b[1] * hsQ[4] + q0b[2] * hsQ[5] + q0b[3] * hsQ[6];
+    d = Math.max(-1, Math.min(1, d));
+    var th = Math.acos(d), sn = Math.sin(th) || 1e-9;
+    var qa = Math.sin((1 - e) * th) / sn, qb = Math.sin(e * th) / sn;
+    sim.data.qpos[3] = qa * q0b[0] + qb * hsQ[3];
+    sim.data.qpos[4] = qa * q0b[1] + qb * hsQ[4];
+    sim.data.qpos[5] = qa * q0b[2] + qb * hsQ[5];
+    sim.data.qpos[6] = qa * q0b[3] + qb * hsQ[6];
+    for (i = 0; i < sim.nu; i++) sim.data.qpos[7 + i] = j0[i] + e * (hsQ[7 + i] - j0[i]);
+    sim.mj.mj_forward(sim.model, sim.data);
+    var scb = sim.computeScores(); sVal = scb.s; scores = scb;
+    if (++chainSteps >= CHAIN_BLEND_STEPS) {
+      for (var v = 0; v < sim.data.qvel.length; v++) sim.data.qvel[v] = 0;
+      sim.mj.mj_forward(sim.model, sim.data);
+      sim._lastA = new Float64Array(sim.q2); sim._errPrev = null;
+      sim.setHeadRolling(1.0, HEAD_ROLLING); // Rolling-Widerstand fuer lange Haltezeit
+      chainPhase = 'chainHold'; chainSteps = 0; chainLowSteps = 0;
+      holdCurSteps = 0;
+      setStatus('ok', 'KOPFSTAND (meine Policy)');
       flash('POLICY \u00dcBERNIMMT', 'var(--ok)');
     }
     return;
   }
-  if (seqPhase === 'hold') {
+  if (chainPhase === 'chainHold') {
     var obs = sim.obs52();
     if ($('cbNoise').checked) {
-      for (var n1 = 0; n1 < 3; n1++) obs[n1] += 0.03 * DuckCore.gaussPair(rng);
-      for (var n2 = 0; n2 < 3; n2++) obs[3 + n2] += 0.08 * DuckCore.gaussPair(rng);
-      for (var n3 = 0; n3 < 14; n3++) obs[6 + n3] += 0.01 * DuckCore.gaussPair(rng);
-      for (var n4 = 0; n4 < 14; n4++) obs[20 + n4] += 0.15 * DuckCore.gaussPair(rng);
+      for (var m1 = 0; m1 < 3; m1++) obs[m1] += 0.03 * DuckCore.gaussPair(rng);
+      for (var m2 = 0; m2 < 3; m2++) obs[3 + m2] += 0.08 * DuckCore.gaussPair(rng);
+      for (var m3 = 0; m3 < 14; m3++) obs[6 + m3] += 0.01 * DuckCore.gaussPair(rng);
+      for (var m4 = 0; m4 < 14; m4++) obs[20 + m4] += 0.15 * DuckCore.gaussPair(rng);
     }
     var a = policy.act(obs);
     var push = null;
     if (pendingPush) { push = pendingPush; pendingPush = null; }
-    var r = sim.stepControl(a, push);
-    sVal = r.s; scores = r.scores;
-    if (r.s > 0.5) {
-      holdCurSteps++;
-      seqLowSteps = 0;
+    var rh = sim.stepControl(a, push);
+    sVal = rh.s; scores = rh.scores;
+    if (rh.s > 0.5) {
+      holdCurSteps++; chainLowSteps = 0;
       if (holdCurSteps > holdBestSteps) holdBestSteps = holdCurSteps;
       if (holdBestSteps > epBestAllSteps) epBestAllSteps = holdBestSteps;
-    } else {
-      holdCurSteps = 0;
-      seqLowSteps++;
-    }
-    if (r.terminated || seqLowSteps >= 75) {
-      // 1.5 s unter der Halteschwelle (oder echte Termination) = Sturz ->
-      // Sequenz-Ende; Auto-Reset startet den naechsten Ablauf.
+    } else { holdCurSteps = 0; chainLowSteps++; }
+    if (rh.terminated || chainLowSteps >= 75) { // 1.5 s unter Schwelle = Sturz
+      sim.setHeadRolling(1.0, 0);
       episodeOver = true; overAt = performance.now();
-      setStatus('bad', 'Gekippt');
+      setStatus('bad', 'Gekippt \u2013 Loop startet neu');
       flash('GEKIPPT', 'var(--bad)');
-    } else if (sVal > 0.5) setStatus('ok', 'HALT \u2713');
-    else if (sVal > 0.05) setStatus('mid', 'Instabil');
+    } else if (sVal > 0.5) setStatus('ok', 'KOPFSTAND \u2713');
+    else if (sVal > 0.05) setStatus('mid', 'KOPFSTAND: Instabil');
   }
+}
+
+function chainFail(reason) {
+  sim.setHeadRolling(1.0, 0);
+  episodeOver = true; overAt = performance.now();
+  setStatus('bad', reason + ' \u2013 Loop startet neu');
+  flash('FEHLGESCHLAGEN', 'var(--bad)');
 }
 
 function frame(now) {
@@ -365,7 +421,7 @@ function frame(now) {
     }
     frame._acc = acc;
     if (episodeOver && $('cbAuto').checked && now - overAt > 1100) {
-      if (seqMode) startSequence(); else resetEpisode();
+      if (chainMode) startChain(); else resetEpisode();
     }
   }
   syncMeshes();
@@ -404,7 +460,7 @@ function initUI() {
     $('impV').textContent = parseFloat(this.value).toFixed(1) + ' Ns';
   });
   $('btnReset').addEventListener('click', resetEpisode);
-  $('btnSeq').addEventListener('click', startSequence);
+  $('btnSeq').addEventListener('click', startChain);
   $('btnPush').addEventListener('click', function () {
     if (!running || episodeOver) return;
     var J = parseFloat($('imp').value);
@@ -414,9 +470,9 @@ function initUI() {
   });
 }
 
-/* ---------------- Test-Hook (?test=1 Paritaet, ?test=2 Sequenz) ---------------- */
+/* ---------------- Test-Hook (?test=1 Paritaet, ?test=2 Kette) ---------------- */
 function runTestHook() {
-  if (location.search.indexOf('test=2') >= 0) { runTestHookSeq(); return; }
+  if (location.search.indexOf('test=2') >= 0) { runTestHookChain(); return; }
   var results = [];
   var scen = [
     { name: 'base_tilt0', tilt: 0, noise: false },
@@ -447,37 +503,74 @@ function runTestHook() {
   console.log('TEST-RESULT', JSON.stringify(window.__TEST));
 }
 
-/* Sequenz-Test (?test=2): volle Kopfstand-Sequenz headless durchfahren. */
-function runTestHookSeq() {
-  var res = { standSettled: false, thetaLandDeg: 0, feetPen: 0, headPen: 0,
-              reachedHold: false, holdBest: 0, terminated: false };
+/* Ketten-Test (?test=2): STEHEN -> ROULADE -> UEBERNAHME -> KOPFSTAND headless. */
+function runTestHookChain() {
+  var i, t;
+  var res = { standOK: false, standPGZ: 0, catchStep: -1, blendPGZ: 0, holdBest: 0, holdTotal: 0, terminated: false };
+  // STAND
   sim.resetStand();
-  for (var i = 0; i < DuckCore.SEQ_N_STAND; i++) sim.stepControl(DuckCore.SEQ_DEFAULT_POSE);
-  res.standSettled = sim.data.qpos[2] > 0.05 && isFinite(sim.data.qpos[2]);
-  seq.begin();
-  res.thetaLandDeg = +seq.thetaLandDeg.toFixed(1);
-  var guard = 0;
-  while (seq.phase !== 'release' && guard++ < 400) seq.step();
-  res.feetPen = +seq.feetPen.toFixed(4);
-  res.headPen = +seq.headPen.toFixed(4);
-  sim.reset({ tiltRad: 0, fall: 0.001, jointNoise: 0, velNoise: 0, rng: rng });
-  var holdBest = 0, cur = 0;
-  for (var t = 0; t < 500; t++) {
-    var r = sim.stepControl(policy.act(sim.obs52()));
-    if (r.s > 0.5) { cur++; if (cur > holdBest) holdBest = cur; } else cur = 0;
-    if (r.terminated) { res.terminated = true; break; }
+  for (t = 0; t < CHAIN_STAND_STEPS; t++) {
+    var rs = sim.stepRef(standPol.act(sim.obs61()));
+    if (rs.terminated) break;
   }
-  res.holdBest = +(holdBest * 0.02).toFixed(2);
-  res.reachedHold = res.holdBest > 0;
-  window.__TEST = { done: true, seq: res, go: res.standSettled && res.reachedHold &&
-                    res.holdBest >= 0.7 && res.feetPen >= -0.003 && res.headPen >= -0.003 };
-  console.log('TEST-SEQ', JSON.stringify(window.__TEST));
+  res.standOK = sim.projGravZ() < -0.85 && sim.data.qpos[2] > 0.02;
+  res.standPGZ = +sim.projGravZ().toFixed(3);
+  // ROULADE + Catch
+  for (t = 0; t < CHAIN_ROLL_MAX; t++) {
+    var rr = sim.stepRef(rollPol.act(sim.obs61()));
+    var gyro = Math.hypot(sim.data.qvel[3], sim.data.qvel[4], sim.data.qvel[5]);
+    var hz = sim.headZ(), fz = sim.feetZmin(), pgz = sim.projGravZ();
+    if (t > 8 && pgz > 0.65 && fz > hz + 0.03 && gyro < 5.0 && hz - sim.headR < 0.012) { res.catchStep = t; break; }
+    if (rr.terminated) break;
+  }
+  // UEBERNAHME (Blend)
+  if (res.catchStep >= 0) {
+    var hsQ = sim.hsQ;
+    var p0 = [sim.data.qpos[0], sim.data.qpos[1], sim.data.qpos[2]];
+    var q0 = [sim.data.qpos[3], sim.data.qpos[4], sim.data.qpos[5], sim.data.qpos[6]];
+    var j0 = [];
+    for (i = 0; i < sim.nu; i++) j0.push(sim.data.qpos[7 + i]);
+    for (var s = 0; s < CHAIN_BLEND_STEPS; s++) {
+      var u = (s + 1) / CHAIN_BLEND_STEPS, e = u * u * (3 - 2 * u);
+      sim.data.qpos[0] = p0[0] + e * (hsQ[0] - p0[0]);
+      sim.data.qpos[1] = p0[1] + e * (hsQ[1] - p0[1]);
+      sim.data.qpos[2] = p0[2] + e * (hsQ[2] - p0[2]);
+      var dq = q0[0] * hsQ[3] + q0[1] * hsQ[4] + q0[2] * hsQ[5] + q0[3] * hsQ[6];
+      dq = Math.max(-1, Math.min(1, dq));
+      var th = Math.acos(dq), sn = Math.sin(th) || 1e-9;
+      var qa = Math.sin((1 - e) * th) / sn, qb = Math.sin(e * th) / sn;
+      sim.data.qpos[3] = qa * q0[0] + qb * hsQ[3];
+      sim.data.qpos[4] = qa * q0[1] + qb * hsQ[4];
+      sim.data.qpos[5] = qa * q0[2] + qb * hsQ[5];
+      sim.data.qpos[6] = qa * q0[3] + qb * hsQ[6];
+      for (i = 0; i < sim.nu; i++) sim.data.qpos[7 + i] = j0[i] + e * (hsQ[7 + i] - j0[i]);
+      sim.mj.mj_forward(sim.model, sim.data);
+    }
+    for (var v = 0; v < sim.data.qvel.length; v++) sim.data.qvel[v] = 0;
+    sim.mj.mj_forward(sim.model, sim.data);
+    res.blendPGZ = +sim.projGravZ().toFixed(3);
+    // KOPFSTAND (10 s Fenster)
+    sim.setHeadRolling(1.0, HEAD_ROLLING);
+    sim._lastA = new Float64Array(sim.q2); sim._errPrev = null;
+    var holdCur = 0;
+    for (t = 0; t < 500; t++) {
+      var rh = sim.stepControl(policy.act(sim.obs52()));
+      if (rh.s > 0.5) { holdCur++; res.holdTotal++; if (holdCur > res.holdBest) res.holdBest = holdCur; } else holdCur = 0;
+      if (rh.terminated) { res.terminated = true; break; }
+    }
+    sim.setHeadRolling(1.0, 0);
+  }
+  res.holdBest = +(res.holdBest * 0.02).toFixed(2);
+  res.holdTotal = +(res.holdTotal * 0.02).toFixed(2);
+  window.__TEST = { done: true, chain: res,
+    go: res.standOK && res.catchStep >= 0 && res.blendPGZ > 0.95 && res.holdBest >= 5.0 };
+  console.log('TEST-CHAIN', JSON.stringify(window.__TEST));
 }
 
 /* ---------------- Los ---------------- */
 if (typeof DuckCore === 'undefined' || typeof loadMujoco === 'undefined' ||
     typeof MUJOCO_WASM_B64 === 'undefined' || typeof DUCK_DATA === 'undefined' ||
-    typeof DUCK_VISUAL === 'undefined') {
+    typeof REF_DATA === 'undefined' || typeof DUCK_VISUAL === 'undefined') {
   document.getElementById('loadMsg').textContent = 'Fehler: Assets fehlen!';
 } else {
   boot();
