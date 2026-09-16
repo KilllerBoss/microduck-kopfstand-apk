@@ -284,6 +284,245 @@
     return { s: sc.s, scores: sc, terminated: terminated };
   };
 
+  // ---------------- Sequenz: STAND -> Kippen -> Kopf-Kontakt -> Beine hoch -> Release ----------------
+  // Portiert aus scripts/seq_test/seq_proto.py (Zweipivot-Flip, bewiesen).
+  // Phasen: 'stand' (Physik, ctrl=DEFAULT_POSE) -> 'A' Kippen um Zehenspitzen bis
+  // Kopfkontakt -> 'B' Rotation um Kopf-Kugelzentrum + Beine hochziehen ->
+  // 'C' Blend auf exakten Eval-Init -> Release (App ruft sim.reset() und schaltet
+  // auf Policy). Alles kinematisch (mj_forward), kein Bodendurchbruch (Ground-Clamp).
+
+  var SEQ_DEFAULT_POSE = [0, -0.0872665, -0.457924, -0.00494, 0.452984,
+                          0.349066, 0.349066, 0, 0, 0, 0.0872665, 0.457924, 0.00494, -0.452984];
+  var SEQ_N_STAND = 25, SEQ_N_A = 55, SEQ_N_B = 75, SEQ_N_C = 20;
+  var LEG_IDX = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13];
+  var NECK_IDX = [5, 6, 7, 8];
+
+  function seqSmooth(u) { return u * u * (3 - 2 * u); }
+  function seqSlerp(q0, q1, t) {
+    var dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+    dot = Math.max(-1, Math.min(1, dot));
+    var th = Math.acos(dot);
+    if (th < 1e-6) return [(1 - t) * q0[0] + t * q1[0], (1 - t) * q0[1] + t * q1[1],
+                           (1 - t) * q0[2] + t * q1[2], (1 - t) * q0[3] + t * q1[3]];
+    var s = Math.sin(th);
+    var a = Math.sin((1 - t) * th) / s, b = Math.sin(t * th) / s;
+    return [a * q0[0] + b * q1[0], a * q0[1] + b * q1[1], a * q0[2] + b * q1[2], a * q0[3] + b * q1[3]];
+  }
+
+  function makeSequence(sim) {
+    var mj = sim.mj, m = sim.model, d = sim.data;
+    var nu = sim.nu;
+    var st = {
+      phase: 'idle', k: 0,
+      thetaLandDeg: 0, headPen: 0, feetPen: 0,
+      fp: null, axis: null, t: null
+    };
+
+    function setQposAll(pos, quat, joints) {
+      d.qpos[0] = pos[0]; d.qpos[1] = pos[1]; d.qpos[2] = pos[2];
+      d.qpos[3] = quat[0]; d.qpos[4] = quat[1]; d.qpos[5] = quat[2]; d.qpos[6] = quat[3];
+      for (var j = 0; j < nu; j++) d.qpos[7 + j] = joints[j];
+    }
+    function headPos() {
+      var hg = sim.headG * 3;
+      return [d.geom_xpos[hg], d.geom_xpos[hg + 1], d.geom_xpos[hg + 2]];
+    }
+    function feetZmin() {
+      var zmin = 1e9;
+      for (var s2 = 0; s2 < sim.soleGids.length; s2++) {
+        var g = sim.soleGids[s2], gm = g * 9, gp = g * 3;
+        var corners = sim.soleCorners[s2];
+        for (var ci = 0; ci < corners.length; ci++) {
+          var cn = corners[ci];
+          var wz = d.geom_xmat[gm + 6] * cn[0] + d.geom_xmat[gm + 7] * cn[1] + d.geom_xmat[gm + 8] * cn[2]
+                 + d.geom_xpos[gp + 2];
+          if (wz < zmin) zmin = wz;
+        }
+      }
+      return zmin;
+    }
+    function groundClear() {
+      var fz = feetZmin();
+      if (fz < -0.0015) {
+        d.qpos[2] += (-0.0015 - fz);
+        mj.mj_forward(m, d);
+      }
+    }
+    function axisAngleQuatW(axis, ang) { return axisAngleQuat(axis, ang, [0, 0, 0, 0]); }
+    function rotAbout(pStart, pivot, axis, theta) {
+      var n = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]) || 1;
+      var ax = [axis[0] / n, axis[1] / n, axis[2] / n];
+      var c = Math.cos(theta), s = Math.sin(theta);
+      // R = I c + s K + (1-c) K^2  (Rodrigues)
+      var K = [0, -ax[2], ax[1], ax[2], 0, -ax[0], -ax[1], ax[0], 0];
+      var K2 = [
+        K[0] * K[0] + K[1] * K[3] + K[2] * K[6], K[0] * K[1] + K[1] * K[4] + K[2] * K[7], K[0] * K[2] + K[1] * K[5] + K[2] * K[8],
+        K[3] * K[0] + K[4] * K[3] + K[5] * K[6], K[3] * K[1] + K[4] * K[4] + K[5] * K[7], K[3] * K[2] + K[4] * K[5] + K[5] * K[8],
+        K[6] * K[0] + K[7] * K[3] + K[8] * K[6], K[6] * K[1] + K[7] * K[4] + K[8] * K[7], K[6] * K[2] + K[7] * K[5] + K[8] * K[8]];
+      var R = [
+        c + (1 - c) * K2[0], s * K[1] + (1 - c) * K2[1], s * K[2] + (1 - c) * K2[2],
+        s * K[3] + (1 - c) * K2[3], c + (1 - c) * K2[4], s * K[5] + (1 - c) * K2[5],
+        s * K[6] + (1 - c) * K2[6], s * K[7] + (1 - c) * K2[7], c + (1 - c) * K2[8]];
+      var v = [pStart[0] - pivot[0], pStart[1] - pivot[1], pStart[2] - pivot[2]];
+      return [pivot[0] + R[0] * v[0] + R[1] * v[1] + R[2] * v[2],
+              pivot[1] + R[3] * v[0] + R[4] * v[1] + R[5] * v[2],
+              pivot[2] + R[6] * v[0] + R[7] * v[1] + R[8] * v[2]];
+    }
+
+    var pStart, fp, axis, tdir, thetaLand, pLand, hcLand, posEnd, quatEnd;
+
+    // begin(): nach dem Stand-Settle aufrufen (misst Pivot/Achse/Bisektion)
+    function begin() {
+      var hc0 = headPos();
+      pStart = [d.qpos[0], d.qpos[1], d.qpos[2]];
+
+      // Sohlen-Mitten und Tipprichtung senkrecht zur Fuss-Trennachse (beide
+      // Fuesse bleiben auf der Rotationsachse), in Kopfrichtung orientiert
+      var c0 = sim.soleGids.map(function (g) {
+        var gp = g * 3; return [d.geom_xpos[gp], d.geom_xpos[gp + 1], d.geom_xpos[gp + 2]];
+      });
+      var mid = [(c0[0][0] + c0[1][0]) / 2, (c0[0][1] + c0[1][1]) / 2, 0];
+      var dv = [hc0[0] - mid[0], hc0[1] - mid[1], hc0[2] - mid[2]];
+      var sep = [c0[1][0] - c0[0][0], c0[1][1] - c0[0][1]];
+      var nsep = Math.hypot(sep[0], sep[1]) || 1;
+      sep = [sep[0] / nsep, sep[1] / nsep];
+      tdir = [-sep[1], sep[0]];
+      if (tdir[0] * dv[0] + tdir[1] * dv[1] < 0) tdir = [-tdir[0], -tdir[1]];
+      axis = [tdir[1], -tdir[0], 0];
+
+      // Pivot = Vorderkante der Sohlen in Tipprichtung (Zehenspitzen)
+      var pts = [];
+      for (var s3 = 0; s3 < sim.soleGids.length; s3++) {
+        var g = sim.soleGids[s3], gm = g * 9, gp = g * 3;
+        var cc = [d.geom_xpos[gp], d.geom_xpos[gp + 1], d.geom_xpos[gp + 2]];
+        var best = -1e9;
+        var corners = sim.soleCorners[s3];
+        for (var ci = 0; ci < corners.length; ci++) {
+          var cn = corners[ci];
+          var wx = d.geom_xmat[gm] * cn[0] + d.geom_xmat[gm + 1] * cn[1] + d.geom_xmat[gm + 2] * cn[2];
+          var wy = d.geom_xmat[gm + 3] * cn[0] + d.geom_xmat[gm + 4] * cn[1] + d.geom_xmat[gm + 5] * cn[2];
+          var proj = (wx) * tdir[0] + (wy) * tdir[1];
+          if (proj > best) best = proj;
+        }
+        pts.push([cc[0] + tdir[0] * best, cc[1] + tdir[1] * best]);
+      }
+      fp = [(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2, 0];
+
+      // Vorzeichencheck: Kopf muss sinken
+      var pt = rotAbout(pStart, fp, axis, 0.1);
+      setQposAll(pt, axisAngleQuatW(axis, 0.1), SEQ_DEFAULT_POSE);
+      mj.mj_forward(m, d);
+      if (headPos()[2] > hc0[2]) axis = [-axis[0], -axis[1], -axis[2]];
+
+      // theta_land: Kopf-Kugel beruehrt Boden (Bisektion)
+      function headZAt(theta) {
+        var pos = rotAbout(pStart, fp, axis, theta);
+        setQposAll(pos, axisAngleQuatW(axis, theta), SEQ_DEFAULT_POSE);
+        mj.mj_forward(m, d);
+        groundClear();
+        return headPos()[2];
+      }
+      var lo = 0, hi = Math.PI / 2;
+      for (var it = 0; it < 40; it++) {
+        var mid2 = 0.5 * (lo + hi);
+        if (headZAt(mid2) > sim.headR) lo = mid2; else hi = mid2;
+      }
+      thetaLand = 0.5 * (lo + hi);
+      st.thetaLandDeg = thetaLand * 180 / Math.PI;
+
+      // Endzustand (Eval-Init) fuer Kopf-Ziel/Blend
+      mj.mj_resetData(m, d);
+      for (var i = 0; i < sim.nq; i++) d.qpos[i] = sim.hsQ[i];
+      for (var j2 = 0; j2 < nu; j2++) d.qpos[7 + j2] = sim.q2[j2];
+      d.qpos[2] += 0.001;
+      mj.mj_forward(m, d);
+      posEnd = [d.qpos[0], d.qpos[1], d.qpos[2]];
+      quatEnd = [d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6]];
+
+      st.phase = 'A'; st.k = 0;
+      st.headPen = 0; st.feetPen = 0;
+      // Zurueck in den gemessenen Stand (App macht Physik-Settle separat)
+    }
+
+    function trackPen() {
+      var hp = headPos(), fz = feetZmin();
+      st.headPen = Math.min(st.headPen, hp[2] - sim.headR);
+      st.feetPen = Math.min(st.feetPen, fz);
+    }
+
+    function step() {
+      var k = st.k;
+      if (st.phase === 'A') {
+        var u = seqSmooth((k + 1) / SEQ_N_A);
+        var th = thetaLand * u;
+        var pos = rotAbout(pStart, fp, axis, th);
+        var quat = axisAngleQuatW(axis, th);
+        var joints = SEQ_DEFAULT_POSE.slice();
+        for (var ni = 0; ni < NECK_IDX.length; ni++) {
+          var i5 = NECK_IDX[ni];
+          joints[i5] = (1 - u) * SEQ_DEFAULT_POSE[i5] + u * sim.q2[i5];
+        }
+        setQposAll(pos, quat, joints);
+        mj.mj_forward(m, d);
+        groundClear();
+        pLand = [d.qpos[0], d.qpos[1], d.qpos[2]];
+        hcLand = headPos();
+        trackPen();
+        if (k + 1 >= SEQ_N_A) { st.phase = 'B'; st.k = 0; return; }
+      } else if (st.phase === 'B') {
+        var b = seqSmooth((k + 1) / SEQ_N_B);
+        var th2 = thetaLand + b * (Math.PI - thetaLand);
+        var pos2 = rotAbout(pLand, hcLand, axis, th2 - thetaLand);
+        var quat2 = axisAngleQuatW(axis, th2);
+        var uLegs = 0.55 + 0.45 * seqSmooth(Math.min(b / 0.45, 1.0));
+        var joints2 = SEQ_DEFAULT_POSE.slice();
+        for (var li = 0; li < LEG_IDX.length; li++) {
+          var i6 = LEG_IDX[li];
+          joints2[i6] = (1 - uLegs) * SEQ_DEFAULT_POSE[i6] + uLegs * sim.q2[i6];
+        }
+        for (var ni2 = 0; ni2 < NECK_IDX.length; ni2++) joints2[NECK_IDX[ni2]] = sim.q2[NECK_IDX[ni2]];
+        setQposAll(pos2, quat2, joints2);
+        mj.mj_forward(m, d);
+        groundClear();
+        trackPen();
+        if (k + 1 >= SEQ_N_B) { st.phase = 'C'; st.k = 0; return; }
+      } else if (st.phase === 'C') {
+        var b2 = seqSmooth((k + 1) / SEQ_N_C);
+        var q0 = [d.qpos[3], d.qpos[4], d.qpos[5], d.qpos[6]];
+        var qm = seqSlerp(q0, quatEnd, b2);
+        var p0 = [d.qpos[0], d.qpos[1], d.qpos[2]];
+        var jm = [];
+        for (var j3 = 0; j3 < nu; j3++) {
+          jm.push((1 - b2) * d.qpos[7 + j3] + b2 * sim.q2[j3]);
+        }
+        setQposAll([p0[0] + b2 * (posEnd[0] - p0[0]), p0[1] + b2 * (posEnd[1] - p0[1]), p0[2] + b2 * (posEnd[2] - p0[2])], qm, jm);
+        mj.mj_forward(m, d);
+        trackPen();
+        if (k + 1 >= SEQ_N_C) {
+          st.phase = 'release'; st.k = 0;
+          return;
+        }
+      }
+      st.k++;
+    }
+
+    st.begin = begin;
+    st.step = step;
+    st.headPos = headPos;
+    st.feetZmin = feetZmin;
+    return st;
+  }
+
+  Sim.prototype.resetStand = function () {
+    var d = this.data;
+    this.mj.mj_resetData(this.model, this.data);
+    for (var i = 0; i < this.nq; i++) d.qpos[i] = this.standQ[i];
+    this.mj.mj_forward(this.model, this.data);
+    this._lastA = new Float64Array(this.nu);
+    this._errPrev = null;
+    this.t = 0;
+  };
+
   // ---------------- Episode-Runner (Test/Headless) ----------------
   function runEpisode(sim, policy, opts) {
     opts = opts || {};
@@ -318,6 +557,7 @@
   return {
     CONTROL_DT: CONTROL_DT, CONTROL_HZ: CONTROL_HZ,
     Sim: Sim, makePolicy: makePolicy, runEpisode: runEpisode,
+    makeSequence: makeSequence, SEQ_DEFAULT_POSE: SEQ_DEFAULT_POSE, SEQ_N_STAND: SEQ_N_STAND,
     mulberry32: mulberry32, gaussPair: gaussPair,
     MJ_GEOM: { PLANE: MJ_GEOM_PLANE, SPHERE: MJ_GEOM_SPHERE, CAPSULE: MJ_GEOM_CAPSULE, BOX: MJ_GEOM_BOX }
   };

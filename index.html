@@ -91,8 +91,9 @@
 
   <div id="panel">
     <div id="btnRow">
-      <button id="btnReset">Start / Reset</button>
-      <button id="btnPush">Schubser</button>
+      <button id="btnSeq" style="background:var(--accent)">Kopfstand-Ablauf</button>
+      <button id="btnReset" style="background:var(--panel2);color:var(--text);border:1px solid var(--line)">Direkt-Halt</button>
+      <button id="btnPush" style="background:var(--panel2);color:var(--text);border:1px solid var(--line)">Schubser</button>
     </div>
     <div id="sliders">
       <div class="sl"><label>Start-Tilt <b id="tiltV">0.0&deg;</b></label>
@@ -106,7 +107,7 @@
       <label class="chk"><input type="checkbox" id="cbAuto" checked> Auto-Reset</label>
       <label class="chk"><input type="checkbox" id="cbSlow"> Zeitlupe &frac14;</label>
     </div>
-    <div id="foot">Policy: BC-Kopie des CMA-Lehrers (52-dim MLP) &middot; Eval: hold 0.97&nbsp;s mean / 1.58&nbsp;s max &middot; Kopf = Nadel-Aequilibrium</div>
+    <div id="foot">Ablauf: Stehen &rarr; Kopf senken &rarr; Beine hoch &rarr; Policy balanciert auf Kopf &middot; Direkt-Halt startet im Kopfstand</div>
   </div>
 </div>
 

@@ -12,8 +12,9 @@ function b64ToUint8(b64) {
 function setBar(id, v) { $(id).firstChild.style.width = (100 * Math.max(0, Math.min(1, v))).toFixed(1) + '%'; }
 
 /* ---------------- Globale App-Zustände ---------------- */
-var sim = null, policy = null, mj = null;
+var sim = null, policy = null, mj = null, seq = null;
 var running = false, episodeOver = false, overAt = 0;
+var seqMode = false, seqPhase = 'idle', seqStandSteps = 0, seqLowSteps = 0;
 var holdCurSteps = 0, holdBestSteps = 0, sVal = 0, scores = null;
 var pendingPush = null;
 var rng = DuckCore.mulberry32(1234567);
@@ -36,6 +37,7 @@ async function boot() {
     msg.textContent = 'Lade Microduck-Modell\u2026';
     sim = new DuckCore.Sim(mj, DUCK_DATA.xml, DUCK_DATA.q2);
     policy = DuckCore.makePolicy(DUCK_DATA.weights);
+    seq = DuckCore.makeSequence(sim);
 
     msg.textContent = 'Baue 3D-Szene\u2026';
     initScene();
@@ -47,7 +49,7 @@ async function boot() {
 
     resetEpisode();
 
-    if (location.search.indexOf('test=1') >= 0) runTestHook();
+    if (location.search.indexOf('test=1') >= 0 || location.search.indexOf('test=2') >= 0) runTestHook();
     requestAnimationFrame(frame);
   } catch (e) {
     msg.innerHTML = 'Fehler: ' + (e && e.message ? e.message : e);
@@ -227,6 +229,8 @@ function buildRobotVisuals() {
 
 /* ---------------- Episode / Steuerung ---------------- */
 function resetEpisode() {
+  seqMode = false; seqPhase = 'idle';
+  $('tilt').disabled = false; $('cbRand').disabled = false;
   var tiltDeg = parseFloat($('tilt').value);
   var tiltRad = 0, axis = [1, 0, 0];
   if ($('cbRand').checked && tiltDeg > 0) {
@@ -242,11 +246,24 @@ function resetEpisode() {
   pendingPush = null; sVal = 0; scores = sim.computeScores();
   epCount++;
   running = true;
-  setStatus('mid', 'Episode ' + epCount);
+  setStatus('mid', 'Direkt: Episode ' + epCount);
+}
+
+/* Volle Sequenz: STAND -> Kopf senken -> Ueberschlag -> Beine hoch -> Policy */
+function startSequence() {
+  seqMode = true; seqPhase = 'stand'; seqStandSteps = 0;
+  $('tilt').disabled = true; $('cbRand').disabled = true;
+  sim.resetStand();
+  holdCurSteps = 0; holdBestSteps = 0; episodeOver = false;
+  pendingPush = null; sVal = 0; scores = sim.computeScores();
+  epCount++;
+  running = true;
+  setStatus('mid', 'STAND');
 }
 
 function doControlStep() {
   if (episodeOver) return;
+  if (seqMode) { doSeqStep(); return; }
   var obs = sim.obs52();
   if ($('cbNoise').checked) {
     for (var n1 = 0; n1 < 3; n1++) obs[n1] += 0.03 * DuckCore.gaussPair(rng);
@@ -272,6 +289,69 @@ function doControlStep() {
   else if (sVal > 0.05) setStatus('mid', 'Instabil');
 }
 
+/* Sequenz-Step: stand (Physik) -> A/B/C (kinematisch) -> hold (Policy) */
+function doSeqStep() {
+  if (seqPhase === 'stand') {
+    sim.stepControl(DuckCore.SEQ_DEFAULT_POSE);
+    if (++seqStandSteps >= DuckCore.SEQ_N_STAND) {
+      seq.begin();
+      seqPhase = 'A';
+      setStatus('mid', 'KOPF SENKEN');
+    }
+    return;
+  }
+  if (seqPhase === 'A' || seqPhase === 'B' || seqPhase === 'C') {
+    seq.step();
+    var sc = sim.computeScores();
+    sVal = sc.s; scores = sc;
+    if (seqPhase === 'A' && seq.phase === 'B') {
+      seqPhase = 'B';
+      setStatus('mid', '\u00dcBERSCHLAG');
+    } else if (seqPhase === 'B' && seq.phase === 'C') {
+      seqPhase = 'C';
+      setStatus('mid', 'BEINE HOCH');
+    } else if (seqPhase === 'C' && seq.phase === 'release') {
+      // Release: exakter Eval-Init, Policy uebernimmt
+      sim.reset({ tiltRad: 0, fall: 0.001, jointNoise: 0, velNoise: 0, rng: rng });
+      seqPhase = 'hold'; holdCurSteps = 0;
+      setStatus('ok', 'BALANCE (Policy)');
+      flash('POLICY \u00dcBERNIMMT', 'var(--ok)');
+    }
+    return;
+  }
+  if (seqPhase === 'hold') {
+    var obs = sim.obs52();
+    if ($('cbNoise').checked) {
+      for (var n1 = 0; n1 < 3; n1++) obs[n1] += 0.03 * DuckCore.gaussPair(rng);
+      for (var n2 = 0; n2 < 3; n2++) obs[3 + n2] += 0.08 * DuckCore.gaussPair(rng);
+      for (var n3 = 0; n3 < 14; n3++) obs[6 + n3] += 0.01 * DuckCore.gaussPair(rng);
+      for (var n4 = 0; n4 < 14; n4++) obs[20 + n4] += 0.15 * DuckCore.gaussPair(rng);
+    }
+    var a = policy.act(obs);
+    var push = null;
+    if (pendingPush) { push = pendingPush; pendingPush = null; }
+    var r = sim.stepControl(a, push);
+    sVal = r.s; scores = r.scores;
+    if (r.s > 0.5) {
+      holdCurSteps++;
+      seqLowSteps = 0;
+      if (holdCurSteps > holdBestSteps) holdBestSteps = holdCurSteps;
+      if (holdBestSteps > epBestAllSteps) epBestAllSteps = holdBestSteps;
+    } else {
+      holdCurSteps = 0;
+      seqLowSteps++;
+    }
+    if (r.terminated || seqLowSteps >= 75) {
+      // 1.5 s unter der Halteschwelle (oder echte Termination) = Sturz ->
+      // Sequenz-Ende; Auto-Reset startet den naechsten Ablauf.
+      episodeOver = true; overAt = performance.now();
+      setStatus('bad', 'Gekippt');
+      flash('GEKIPPT', 'var(--bad)');
+    } else if (sVal > 0.5) setStatus('ok', 'HALT \u2713');
+    else if (sVal > 0.05) setStatus('mid', 'Instabil');
+  }
+}
+
 function frame(now) {
   requestAnimationFrame(frame);
   var dt = Math.min((now - (frame._t || now)) / 1000, 0.1);
@@ -284,7 +364,9 @@ function frame(now) {
       doControlStep();
     }
     frame._acc = acc;
-    if (episodeOver && $('cbAuto').checked && now - overAt > 1100) resetEpisode();
+    if (episodeOver && $('cbAuto').checked && now - overAt > 1100) {
+      if (seqMode) startSequence(); else resetEpisode();
+    }
   }
   syncMeshes();
   hud();
@@ -322,6 +404,7 @@ function initUI() {
     $('impV').textContent = parseFloat(this.value).toFixed(1) + ' Ns';
   });
   $('btnReset').addEventListener('click', resetEpisode);
+  $('btnSeq').addEventListener('click', startSequence);
   $('btnPush').addEventListener('click', function () {
     if (!running || episodeOver) return;
     var J = parseFloat($('imp').value);
@@ -331,8 +414,9 @@ function initUI() {
   });
 }
 
-/* ---------------- Test-Hook (?test=1) ---------------- */
+/* ---------------- Test-Hook (?test=1 Paritaet, ?test=2 Sequenz) ---------------- */
 function runTestHook() {
+  if (location.search.indexOf('test=2') >= 0) { runTestHookSeq(); return; }
   var results = [];
   var scen = [
     { name: 'base_tilt0', tilt: 0, noise: false },
@@ -361,6 +445,33 @@ function runTestHook() {
   }
   window.__TEST = { done: true, results: results };
   console.log('TEST-RESULT', JSON.stringify(window.__TEST));
+}
+
+/* Sequenz-Test (?test=2): volle Kopfstand-Sequenz headless durchfahren. */
+function runTestHookSeq() {
+  var res = { standSettled: false, thetaLandDeg: 0, feetPen: 0, headPen: 0,
+              reachedHold: false, holdBest: 0, terminated: false };
+  sim.resetStand();
+  for (var i = 0; i < DuckCore.SEQ_N_STAND; i++) sim.stepControl(DuckCore.SEQ_DEFAULT_POSE);
+  res.standSettled = sim.data.qpos[2] > 0.05 && isFinite(sim.data.qpos[2]);
+  seq.begin();
+  res.thetaLandDeg = +seq.thetaLandDeg.toFixed(1);
+  var guard = 0;
+  while (seq.phase !== 'release' && guard++ < 400) seq.step();
+  res.feetPen = +seq.feetPen.toFixed(4);
+  res.headPen = +seq.headPen.toFixed(4);
+  sim.reset({ tiltRad: 0, fall: 0.001, jointNoise: 0, velNoise: 0, rng: rng });
+  var holdBest = 0, cur = 0;
+  for (var t = 0; t < 500; t++) {
+    var r = sim.stepControl(policy.act(sim.obs52()));
+    if (r.s > 0.5) { cur++; if (cur > holdBest) holdBest = cur; } else cur = 0;
+    if (r.terminated) { res.terminated = true; break; }
+  }
+  res.holdBest = +(holdBest * 0.02).toFixed(2);
+  res.reachedHold = res.holdBest > 0;
+  window.__TEST = { done: true, seq: res, go: res.standSettled && res.reachedHold &&
+                    res.holdBest >= 0.7 && res.feetPen >= -0.003 && res.headPen >= -0.003 };
+  console.log('TEST-SEQ', JSON.stringify(window.__TEST));
 }
 
 /* ---------------- Los ---------------- */
