@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Microduck Kopfstand</title>
+<style>
+  :root {
+    --bg: #0e1218; --panel: #161c26; --panel2: #1d2432; --line: #2a3344;
+    --text: #e8ecf3; --dim: #8b96a8; --accent: #ffb400; --ok: #35d07f; --bad: #ff5252;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; touch-action: none; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  /* ---------- HUD oben ---------- */
+  #hud { padding: 8px 12px calc(4px); background: linear-gradient(#12161f, #12161fee); border-bottom: 1px solid var(--line); z-index: 5; }
+  #row1 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #status { font-weight: 700; font-size: 15px; letter-spacing: .3px; }
+  #status.ok { color: var(--ok); } #status.bad { color: var(--bad); } #status.mid { color: var(--accent); }
+  #times { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--dim); text-align: right; }
+  #times b { color: var(--text); font-size: 15px; }
+  .barWrap { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 10px; color: var(--dim); }
+  .barWrap label { width: 44px; flex: none; }
+  .bar { flex: 1; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; border-radius: 4px; transition: width .08s linear; }
+  #barS > div { background: linear-gradient(90deg, #ff5252, #ffb400, #35d07f); }
+  .bar.mini { height: 5px; } .bar.mini > div { background: #5aa2ff; }
+  #subRow { display: flex; gap: 10px; margin-top: 5px; }
+  #subRow .barWrap { margin: 0; flex: 1; }
+  /* ---------- Canvas ---------- */
+  #view { flex: 1; position: relative; min-height: 0; }
+  #view canvas { display: block; width: 100%; height: 100%; }
+  #badge { position: absolute; right: 8px; top: 8px; font-size: 10px; color: var(--dim);
+    background: #0008; padding: 3px 8px; border-radius: 8px; pointer-events: none; }
+  #flash { position: absolute; left: 50%; top: 40%; transform: translate(-50%,-50%);
+    font-size: 22px; font-weight: 800; opacity: 0; pointer-events: none; transition: opacity .25s; }
+  /* ---------- Panel unten ---------- */
+  #panel { background: var(--panel); border-top: 1px solid var(--line); padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); z-index: 5; }
+  #btnRow { display: flex; gap: 8px; }
+  button { flex: 1; padding: 13px 8px; font-size: 15px; font-weight: 700; border: 0; border-radius: 10px;
+    background: var(--accent); color: #201800; }
+  button:active { filter: brightness(.85); }
+  #btnPush { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+  #sliders { display: flex; gap: 14px; margin-top: 10px; }
+  .sl { flex: 1; }
+  .sl label { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); margin-bottom: 2px; }
+  .sl label b { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; height: 26px; accent-color: var(--accent); }
+  #checks { display: flex; gap: 12px; margin-top: 4px; flex-wrap: wrap; }
+  .chk { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--dim); }
+  .chk input { accent-color: var(--accent); width: 16px; height: 16px; }
+  #foot { margin-top: 6px; font-size: 10px; color: var(--dim); text-align: center; }
+  /* ---------- Loading ---------- */
+  #load { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; z-index: 50; transition: opacity .4s; }
+  #load h1 { font-size: 20px; font-weight: 800; }
+  #load h1 span { color: var(--accent); }
+  #loadMsg { color: var(--dim); font-size: 13px; }
+  .spinner { width: 34px; height: 34px; border: 3px solid var(--panel2); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="load">
+  <h1>Microduck <span>Kopfstand</span></h1>
+  <div class="spinner"></div>
+  <div id="loadMsg">Lade MuJoCo WASM (10 MB)&hellip;</div>
+</div>
+
+<div id="app" style="visibility:hidden">
+  <div id="hud">
+    <div id="row1">
+      <div id="status" class="mid">Bereit</div>
+      <div id="times">Hold <b id="holdCur">0.00</b>s &middot; Best <b id="holdBest">0.00</b>s &middot; <span id="epT">0.0</span>s</div>
+    </div>
+    <div class="barWrap"><label>Score s</label><div class="bar" id="barS"><div></div></div><b id="sVal" style="width:34px;text-align:right">0.00</b></div>
+    <div id="subRow">
+      <div class="barWrap"><label>Invert</label><div class="bar mini" id="barInv"><div></div></div></div>
+      <div class="barWrap"><label>Kopf</label><div class="bar mini" id="barHead"><div></div></div></div>
+      <div class="barWrap"><label>Rumpf</label><div class="bar mini" id="barBody"><div></div></div></div>
+      <div class="barWrap"><label>F&uuml;&szlig;e</label><div class="bar mini" id="barFeet"><div></div></div></div>
+    </div>
+  </div>
+
+  <div id="view">
+    <div id="badge">MuJoCo 3.13 WASM &middot; Policy 50&nbsp;Hz</div>
+    <div id="flash"></div>
+  </div>
+
+  <div id="panel">
+    <div id="btnRow">
+      <button id="btnReset">Start / Reset</button>
+      <button id="btnPush">Schubser</button>
+    </div>
+    <div id="sliders">
+      <div class="sl"><label>Start-Tilt <b id="tiltV">0.0&deg;</b></label>
+        <input type="range" id="tilt" min="0" max="4" step="0.25" value="0"></div>
+      <div class="sl"><label>Schub-Impuls <b id="impV">1.5 Ns</b></label>
+        <input type="range" id="imp" min="0.3" max="2.5" step="0.1" value="1.5"></div>
+    </div>
+    <div id="checks">
+      <label class="chk"><input type="checkbox" id="cbRand"> Zufalls-Tilt</label>
+      <label class="chk"><input type="checkbox" id="cbNoise"> Obs-Rauschen</label>
+      <label class="chk"><input type="checkbox" id="cbAuto" checked> Auto-Reset</label>
+      <label class="chk"><input type="checkbox" id="cbSlow"> Zeitlupe &frac14;</label>
+    </div>
+    <div id="foot">Policy: BC-Kopie des CMA-Lehrers (52-dim MLP) &middot; Eval: hold 0.97&nbsp;s mean / 1.58&nbsp;s max &middot; Kopf = Nadel-Aequilibrium</div>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="mujoco_glue.js"></script>
+<script src="data_wasm.js"></script>
+<script src="data_policy.js"></script>
+<script src="mj_core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
